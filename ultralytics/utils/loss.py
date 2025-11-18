@@ -10,8 +10,9 @@ import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
-from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
+from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
+from ultralytics.utils.cobb import COBBCoder
 
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
@@ -655,20 +656,27 @@ class v8ClassificationLoss:
 
 
 class v8OBBLoss(v8DetectionLoss):
-    """Calculates losses for object detection, classification, and box distribution in rotated YOLO models."""
+    """COBB-based rotated detection loss that augments YOLOv8 regression with ratio/score supervision."""
 
     def __init__(self, model):
-        """Initialize v8OBBLoss with model, assigner, and rotated bbox loss; model must be de-paralleled."""
         super().__init__(model)
         self.assigner = RotatedTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
+        head = model.model[-1]
+        cobb_cfg = getattr(head, "cobb_cfg", {"ratio_type": "sig", "pow_iou": 1.0})
+        self.cobb = COBBCoder(**cobb_cfg)
+        args = getattr(model, "args", {})
+        self.ratio_weight = getattr(args, "cobb_ratio_weight", 16.0)
+        self.score_weight = getattr(args, "cobb_score_weight", 1.0)
+        self.score_dim = getattr(head, "score_dim", 4)
+        self.ratio_loss_fn = nn.SmoothL1Loss(reduction="mean")
+        self.score_loss_fn = nn.SmoothL1Loss(reduction="mean")
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
-        """Preprocess targets for oriented bounding box detection."""
         if targets.shape[0] == 0:
             out = torch.zeros(batch_size, 0, 6, device=self.device)
         else:
-            i = targets[:, 0]  # image index
+            i = targets[:, 0]
             _, counts = i.unique(return_counts=True)
             counts = counts.to(dtype=torch.int32)
             out = torch.zeros(batch_size, counts.max(), 6, device=self.device)
@@ -681,48 +689,47 @@ class v8OBBLoss(v8DetectionLoss):
         return out
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Calculate and return the loss for oriented bounding box detection."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
-        feats, pred_angle = preds if isinstance(preds[0], list) else preds[1]
-        batch_size = pred_angle.shape[0]  # batch size, number of masks, mask height, mask width
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1
-        )
-
-        # b, grids, ..
+        loss = torch.zeros(5, device=self.device)  # box, cls, dfl, ratio, score
+        feats, ratio_logits, score_logits = preds if isinstance(preds[0], list) else preds[1]
+        batch_size = feats[0].shape[0]
+        merged = torch.cat([xi.view(batch_size, self.no, -1) for xi in feats], 2)
+        pred_distri, pred_scores = merged.split((self.reg_max * 4, self.nc), 1)
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
-        pred_angle = pred_angle.permute(0, 2, 1).contiguous()
+        ratio_pred = torch.sigmoid(ratio_logits).permute(0, 2, 1).contiguous()
+        score_pred = torch.sigmoid(score_logits).permute(0, 2, 1).contiguous()
+        score_mix = score_pred / (score_pred.sum(dim=-1, keepdim=True) + 1e-6)
 
         dtype = pred_scores.dtype
-        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
-        # targets
         try:
             batch_idx = batch["batch_idx"].view(-1, 1)
             targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"].view(-1, 5)), 1)
             rw, rh = targets[:, 4] * imgsz[0].item(), targets[:, 5] * imgsz[1].item()
-            targets = targets[(rw >= 2) & (rh >= 2)]  # filter rboxes of tiny size to stabilize training
+            targets = targets[(rw >= 2) & (rh >= 2)]
             targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-            gt_labels, gt_bboxes = targets.split((1, 5), 2)  # cls, xywhr
+            gt_labels, gt_bboxes = targets.split((1, 5), 2)
             mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
         except RuntimeError as e:
             raise TypeError(
-                "ERROR ❌ OBB dataset incorrectly formatted or not a OBB dataset.\n"
-                "This error can occur when incorrectly training a 'OBB' model on a 'detect' dataset, "
-                "i.e. 'yolo train model=yolo11n-obb.pt data=coco8.yaml'.\nVerify your dataset is a "
-                "correctly formatted 'OBB' dataset using 'data=dota8.yaml' "
-                "as an example.\nSee https://docs.ultralytics.com/datasets/obb/ for help."
+                "ERROR ❌ OBB dataset incorrectly formatted. Ensure 'data' points to an OBB dataset."
             ) from e
 
-        # Pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri, pred_angle)  # xyxy, (b, h*w, 4)
+        pred_offsets = pred_distri
+        if self.use_dfl:
+            b, a, c = pred_distri.shape
+            pred_offsets = pred_distri.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_distri.dtype))
+        hbboxes = dist2bbox(pred_offsets, anchor_points, xywh=False)
+        hbboxes = hbboxes.view(-1, 4)
+        ratio_flat = ratio_pred.view(-1, 1)
+        score_flat = score_mix.view(-1, score_mix.shape[-1])
+        pred_rbboxes = self.cobb.mix_candidates(hbboxes, ratio_flat, score_flat).view(batch_size, -1, 5)
 
-        bboxes_for_assigner = pred_bboxes.clone().detach()
-        # Only the first four elements need to be scaled
+        bboxes_for_assigner = pred_rbboxes.detach().clone()
         bboxes_for_assigner[..., :4] *= stride_tensor
-        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
             bboxes_for_assigner.type(gt_bboxes.dtype),
             anchor_points * stride_tensor,
@@ -732,43 +739,46 @@ class v8OBBLoss(v8DetectionLoss):
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
 
-        # Cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
-
-        # Bbox loss
         if fg_mask.sum():
             target_bboxes[..., :4] /= stride_tensor
             loss[0], loss[2] = self.bbox_loss(
-                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+                pred_distri, pred_rbboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
         else:
-            loss[0] += (pred_angle * 0).sum()
+            loss[0] += (pred_rbboxes[:, :, 0:1] * 0).sum()
 
-        loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.cls  # cls gain
-        loss[2] *= self.hyp.dfl  # dfl gain
+        ratio_targets = torch.zeros((*gt_bboxes.shape[:-1], 1), device=self.device, dtype=gt_bboxes.dtype)
+        score_targets = torch.zeros((*gt_bboxes.shape[:-1], self.score_dim), device=self.device, dtype=gt_bboxes.dtype)
+        valid_mask = mask_gt.squeeze(-1)
+        if valid_mask.any():
+            encoded_ratio, encoded_score = self.cobb.encode(gt_bboxes[valid_mask])
+            ratio_targets[valid_mask] = encoded_ratio
+            score_targets[valid_mask, : encoded_score.shape[-1]] = encoded_score
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+        if fg_mask.any():
+            fg = torch.nonzero(fg_mask, as_tuple=False)
+            b_idx = fg[:, 0]
+            a_idx = fg[:, 1]
+            gt_idx = target_gt_idx[fg_mask].long()
+            ratio_pos = ratio_pred[b_idx, a_idx, 0]
+            ratio_tgt = ratio_targets[b_idx, gt_idx, 0]
+            score_pos = score_pred[b_idx, a_idx]
+            score_tgt = score_targets[b_idx, gt_idx]
+            loss[3] = self.ratio_loss_fn(ratio_pos, ratio_tgt)
+            loss[4] = self.score_loss_fn(score_pos, score_tgt)
+        else:
+            loss[3] += (ratio_pred * 0).sum()
+            loss[4] += (score_pred * 0).sum()
 
-    def bbox_decode(
-        self, anchor_points: torch.Tensor, pred_dist: torch.Tensor, pred_angle: torch.Tensor
-    ) -> torch.Tensor:
-        """Decode predicted object bounding box coordinates from anchor points and distribution.
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.cls
+        loss[2] *= self.hyp.dfl
+        loss[3] *= self.ratio_weight
+        loss[4] *= self.score_weight
 
-        Args:
-            anchor_points (torch.Tensor): Anchor points, (h*w, 2).
-            pred_dist (torch.Tensor): Predicted rotated distance, (bs, h*w, 4).
-            pred_angle (torch.Tensor): Predicted angle, (bs, h*w, 1).
-
-        Returns:
-            (torch.Tensor): Predicted rotated bounding boxes with angles, (bs, h*w, 5).
-        """
-        if self.use_dfl:
-            b, a, c = pred_dist.shape  # batch, anchors, channels
-            pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
-        return torch.cat((dist2rbox(pred_dist, pred_angle, anchor_points), pred_angle), dim=-1)
+        return loss * batch_size, loss.detach()
 
 
 class E2EDetectLoss:

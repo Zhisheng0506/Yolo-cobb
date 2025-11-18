@@ -12,7 +12,9 @@ import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils import NOT_MACOS14
-from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
+from ultralytics.utils import ops
+from ultralytics.utils.cobb import COBBCoder
+from ultralytics.utils.tal import dist2bbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN
@@ -283,7 +285,16 @@ class OBB(Detect):
         >>> outputs = obb(x)
     """
 
-    def __init__(self, nc: int = 80, ne: int = 1, ch: tuple = ()):
+    def __init__(
+        self,
+        nc: int = 80,
+        ne: int = 1,
+        ch: tuple = (),
+        ratio_dim: int = 1,
+        score_dim: int = 4,
+        cobb_ratio_type: str = "sig",
+        cobb_pow_iou: float = 1.0,
+    ):
         """Initialize OBB with number of classes `nc` and layer channels `ch`.
 
         Args:
@@ -292,29 +303,48 @@ class OBB(Detect):
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
         super().__init__(nc, ch)
-        self.ne = ne  # number of extra parameters
+        self.ne = ne
+        self.ratio_dim = ratio_dim
+        self.score_dim = score_dim
+        self.cobb_cfg = dict(ratio_type=cobb_ratio_type, pow_iou=cobb_pow_iou)
+        self.cobb = COBBCoder(**self.cobb_cfg)
 
-        c4 = max(ch[0] // 4, self.ne)
-        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.ne, 1)) for x in ch)
+        c_ratio = max(ch[0] // 4, self.ratio_dim)
+        c_score = max(ch[0] // 4, self.score_dim)
+        self.cv_ratio = nn.ModuleList(
+            nn.Sequential(Conv(x, c_ratio, 3), Conv(c_ratio, c_ratio, 3), nn.Conv2d(c_ratio, self.ratio_dim, 1))
+            for x in ch
+        )
+        self.cv_score = nn.ModuleList(
+            nn.Sequential(Conv(x, c_score, 3), Conv(c_score, c_score, 3), nn.Conv2d(c_score, self.score_dim, 1))
+            for x in ch
+        )
 
     def forward(self, x: list[torch.Tensor]) -> torch.Tensor | tuple:
         """Concatenate and return predicted bounding boxes and class probabilities."""
         bs = x[0].shape[0]  # batch size
-        angle = torch.cat([self.cv4[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2)  # OBB theta logits
-        # NOTE: set `angle` as an attribute so that `decode_bboxes` could use it.
-        angle = (angle.sigmoid() - 0.25) * math.pi  # [-pi/4, 3pi/4]
-        # angle = angle.sigmoid() * math.pi / 2  # [0, pi/2]
-        if not self.training:
-            self.angle = angle
+        ratio_logits = torch.cat([self.cv_ratio[i](x[i]).view(bs, self.ratio_dim, -1) for i in range(self.nl)], 2)
+        score_logits = torch.cat([self.cv_score[i](x[i]).view(bs, self.score_dim, -1) for i in range(self.nl)], 2)
         x = Detect.forward(self, x)
         if self.training:
-            return x, angle
-        return torch.cat([x, angle], 1) if self.export else (torch.cat([x[0], angle], 1), (x[1], angle))
+            return x, ratio_logits, score_logits
 
-    def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
-        """Decode rotated bounding boxes."""
-        return dist2rbox(bboxes, self.angle, anchors, dim=1)
+        pred, raw = x
+        ratio_pred = torch.sigmoid(ratio_logits)
+        score_pred = torch.sigmoid(score_logits)
 
+        pred_b, pred_c, pred_a = pred.shape
+        ratio_flat = ratio_pred.permute(0, 2, 1).reshape(-1, self.ratio_dim)
+        score_flat = score_pred.permute(0, 2, 1).reshape(-1, self.score_dim)
+        hbboxes = pred[:, :4, :].permute(0, 2, 1).reshape(-1, 4)
+        hbboxes_xyxy = ops.xywh2xyxy(hbboxes)
+        decoded = self.cobb.decode(hbboxes_xyxy, ratio_flat[:, :1], score_flat)
+        rot_xywh = decoded[:, :4].view(pred_b, pred_a, 4).permute(0, 2, 1)
+        theta = decoded[:, 4].view(pred_b, 1, pred_a)
+        pred[:, :4, :] = rot_xywh
+        pred_out = torch.cat([pred, theta], 1)
+        extra = (raw, ratio_logits, score_logits)
+        return pred_out if self.export else (pred_out, extra)
 
 class Pose(Detect):
     """YOLO Pose head for keypoints models.
