@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
 
 from ultralytics.utils.metrics import batch_probiou
+
+
 @dataclass
 class COBBConfig:
     ratio_type: str = "sig"
@@ -197,5 +198,3 @@ class COBBCoder:
         weights = weights / (weights.sum(dim=-1, keepdim=True) + self.cfg.eps)
         rbboxes = torch.sum(weights.unsqueeze(-1) * candidates, dim=1)
         return rbboxes
-
-
