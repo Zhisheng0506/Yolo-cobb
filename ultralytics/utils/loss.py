@@ -751,11 +751,27 @@ class v8OBBLoss(v8DetectionLoss):
 
         ratio_targets = torch.zeros((*gt_bboxes.shape[:-1], 1), device=self.device, dtype=gt_bboxes.dtype)
         score_targets = torch.zeros((*gt_bboxes.shape[:-1], self.score_dim), device=self.device, dtype=gt_bboxes.dtype)
-        valid_mask = mask_gt.squeeze(-1)
+        valid_mask = mask_gt.squeeze(-1).bool()
         if valid_mask.any():
-            encoded_ratio, encoded_score = self.cobb.encode(gt_bboxes[valid_mask])
-            ratio_targets[valid_mask] = encoded_ratio
-            score_targets[valid_mask, : encoded_score.shape[-1]] = encoded_score
+            flat_gt = gt_bboxes[valid_mask]
+            encoded_ratio, encoded_score = self.cobb.encode(flat_gt)
+            if encoded_score.shape[-1] != self.score_dim:
+                diff = self.score_dim - encoded_score.shape[-1]
+                if diff > 0:
+                    encoded_score = torch.nn.functional.pad(encoded_score, (0, diff))
+                else:
+                    encoded_score = encoded_score[:, : self.score_dim]
+            offset = 0
+            for b in range(batch_size):
+                gt_inds = valid_mask[b].nonzero(as_tuple=False).squeeze(-1)
+                num_gt = gt_inds.numel()
+                if num_gt == 0:
+                    continue
+                ratio_slice = encoded_ratio[offset : offset + num_gt]
+                score_slice = encoded_score[offset : offset + num_gt]
+                ratio_targets[b, gt_inds, 0] = ratio_slice[:, 0]
+                score_targets[b, gt_inds, :] = score_slice
+                offset += num_gt
 
         if fg_mask.any():
             fg = torch.nonzero(fg_mask, as_tuple=False)

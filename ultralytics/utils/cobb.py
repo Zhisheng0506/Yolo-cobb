@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ultralytics.utils.metrics import batch_probiou
+from ultralytics.utils.metrics import probiou
 
 
 @dataclass
@@ -68,7 +68,7 @@ class COBBCoder:
         ratio_raw, _ = self._ratio_from_poly(polys, hbboxes)
         ratio_target = self.encode_ratio(ratio_raw).unsqueeze(-1)
         candidates = self.build_candidates(hbboxes, ratio_raw)
-        score_targets = torch.stack([batch_probiou(candidates[:, i], rbboxes) for i in range(4)], dim=-1).clamp_(0)
+        score_targets = torch.stack([probiou(candidates[:, i], rbboxes).squeeze(-1) for i in range(4)], dim=-1).clamp_(0)
         score_targets = torch.pow(score_targets, self.cfg.pow_iou)
         return ratio_target, score_targets
 
@@ -90,6 +90,10 @@ class COBBCoder:
         return ratio, w_large
 
     def build_candidates(self, hbboxes: torch.Tensor, ratio_raw: torch.Tensor) -> torch.Tensor:
+        dtype = hbboxes.dtype
+        hbboxes = hbboxes.float()
+        ratio_raw = ratio_raw.float()
+
         x_min, y_min, x_max, y_max = hbboxes.unbind(dim=-1)
         w = (x_max - x_min).clamp_min(self.cfg.eps)
         h = (y_max - y_min).clamp_min(self.cfg.eps)
@@ -166,7 +170,7 @@ class COBBCoder:
             ],
             dim=1,
         )
-        return cand
+        return cand.to(dtype)
 
     def decode(self, hbboxes: torch.Tensor, ratio_pred: torch.Tensor, score_pred: torch.Tensor) -> torch.Tensor:
         ratio_raw = self.decode_ratio(ratio_pred.squeeze(-1))
