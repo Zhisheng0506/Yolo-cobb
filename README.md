@@ -1,2 +1,3 @@
-trying to us cobb in the yolo
-it too hard to get better results :(
+# YOLO-COOB
+
+## we are trying to use a new method to encode obb in yolo  but it too hard to get better results :(
