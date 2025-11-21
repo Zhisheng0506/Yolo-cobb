@@ -11,8 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
-from ultralytics.utils import NOT_MACOS14
-from ultralytics.utils import ops
+from ultralytics.utils import NOT_MACOS14, ops
 from ultralytics.utils.cobb import COBBCoder
 from ultralytics.utils.tal import dist2bbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
@@ -333,7 +332,7 @@ class OBB(Detect):
         ratio_pred = torch.sigmoid(ratio_logits)
         score_pred = torch.sigmoid(score_logits)
 
-        pred_b, pred_c, pred_a = pred.shape
+        pred_b, _pred_c, pred_a = pred.shape
         ratio_flat = ratio_pred.permute(0, 2, 1).reshape(-1, self.ratio_dim)
         score_flat = score_pred.permute(0, 2, 1).reshape(-1, self.score_dim)
         hbboxes = pred[:, :4, :].permute(0, 2, 1).reshape(-1, 4)
@@ -345,6 +344,7 @@ class OBB(Detect):
         pred_out = torch.cat([pred, theta], 1)
         extra = (raw, ratio_logits, score_logits)
         return pred_out if self.export else (pred_out, extra)
+
 
 class Pose(Detect):
     """YOLO Pose head for keypoints models.

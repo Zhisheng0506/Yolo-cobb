@@ -68,7 +68,9 @@ class COBBCoder:
         ratio_raw, _ = self._ratio_from_poly(polys, hbboxes)
         ratio_target = self.encode_ratio(ratio_raw).unsqueeze(-1)
         candidates = self.build_candidates(hbboxes, ratio_raw)
-        score_targets = torch.stack([probiou(candidates[:, i], rbboxes).squeeze(-1) for i in range(4)], dim=-1).clamp_(0)
+        score_targets = torch.stack([probiou(candidates[:, i], rbboxes).squeeze(-1) for i in range(4)], dim=-1).clamp_(
+            0
+        )
         score_targets = torch.pow(score_targets, self.cfg.pow_iou)
         return ratio_target, score_targets
 
@@ -187,4 +189,3 @@ class COBBCoder:
         weights = weights / (weights.sum(dim=-1, keepdim=True) + self.cfg.eps)
         rbboxes = torch.sum(weights.unsqueeze(-1) * candidates, dim=1)
         return rbboxes
-
